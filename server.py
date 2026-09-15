@@ -1,487 +1,266 @@
-"""
-BaseWhale Oracle — Real-Time On-Chain Whale & Large Transfer Oracle for Base Mainnet.
+"""Bounded USDC large-transfer detection on Base, paid through x402 v2."""
 
-Detects and tracks high-value transactions, whale flows, and large smart-money liquidity movements
-on Base (Chain ID 8453) directly from on-chain event logs.
-Payable via x402 micro-payments ($0.02 USDC on Base).
-"""
-
-import base64
 from datetime import datetime, timezone
-import json
+from decimal import Decimal
+import logging
 import os
-from typing import Any, Dict, List, Optional
+import re
 
-from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.openapi.utils import get_openapi
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-# Constants & Configuration
-PAYEE_ADDRESS = os.getenv("PAYEE_ADDRESS", "0xb5aFc89b57Fa8270bB7261348179D28099BEa2a0")
+from x402_payment import PaidOperation, PaymentGate, configured_payee
+
+PAYEE_ADDRESS = configured_payee()
 PRICE_USDC = 0.02
-PRICE_ATOMIC = "20000"  # 0.02 USDC (6 decimals = 20,000 atomic units)
+PRICE_ATOMIC = "20000"
 CHAIN_ID = "eip155:8453"
 USDC_ASSET = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 BASE_RPC_URL = os.getenv("BASE_RPC_URL", "https://mainnet.base.org")
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-
-app = FastAPI(
-    title="BaseWhale Oracle x402",
-    description="Real-Time On-Chain Whale & Large Transfer Oracle for Base Mainnet, payable via x402.",
-    version="1.0.0",
-    redirect_slashes=False,
-    contact={
-        "name": "BaseWhale Oracle",
-        "email": "ivansky.dev@gmail.com",
-        "url": "https://github.com/Ivansky1/basewhale-x402",
-    },
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+logger = logging.getLogger("basewhale")
 
 
-def make_x402_challenge(resource_url: str, description: str = "BaseWhale Oracle API Access") -> Dict[str, Any]:
-    """Generate canonical x402 v2 challenge payload passing 100% of discovery checks."""
-    return {
-        "x402Version": 2,
-        "version": 2,
-        "resource": {
-            "url": resource_url,
-            "description": f"{description} (${PRICE_USDC:.2f} USDC)",
-            "mimeType": "application/json",
-        },
-        "accepts": [
-            {
-                "scheme": "exact",
-                "network": CHAIN_ID,
-                "asset": USDC_ASSET,
-                "amount": PRICE_ATOMIC,
-                "maxAmountRequired": PRICE_ATOMIC,
-                "payee": PAYEE_ADDRESS,
-                "payTo": PAYEE_ADDRESS,
-                "maxTimeoutSeconds": 300,
-                "description": f"{description} (${PRICE_USDC:.2f} USDC)",
-                "extra": {
-                    "name": "USD Coin",
-                    "version": "2",
-                    "assetTransferMethod": "eip3009",
-                },
-            }
-        ],
-        "extensions": {
-            "bazaar": {
-                "info": {
-                    "name": "BaseWhale Tracker",
-                    "description": "Real-time detection of whale transfers and smart money flows on Base mainnet.",
-                    "input": {
-                        "type": "object",
-                        "properties": {
-                            "min_usd": {
-                                "type": "number",
-                                "description": "Minimum transaction USD value threshold (default: 25000)",
-                                "default": 25000,
-                            },
-                            "limit": {
-                                "type": "integer",
-                                "description": "Maximum number of whale transactions to return",
-                                "default": 15,
-                            },
-                        },
-                    },
-                    "output": {
-                        "type": "object",
-                        "properties": {
-                            "network": {"type": "string"},
-                            "total_whale_volume_usd": {"type": "number"},
-                            "whale_count": {"type": "integer"},
-                            "transactions": {"type": "array"},
-                            "timestamp": {"type": "string"},
-                        },
-                    },
-                },
-                "schema": {
-                    "properties": {
-                        "input": {
-                            "properties": {
-                                "queryParams": {
-                                    "type": "object",
-                                    "properties": {
-                                        "min_usd": {"type": "number", "default": 25000},
-                                        "limit": {"type": "integer", "default": 15},
-                                    },
-                                },
-                                "body": {
-                                    "type": "object",
-                                    "properties": {
-                                        "min_usd": {"type": "number", "default": 25000},
-                                        "limit": {"type": "integer", "default": 15},
-                                    },
-                                },
-                            }
-                        },
-                        "output": {
-                            "properties": {
-                                "example": {
-                                    "type": "object",
-                                    "properties": {
-                                        "network": {"type": "string"},
-                                        "total_whale_volume_usd": {"type": "number"},
-                                        "whale_count": {"type": "integer"},
-                                        "timestamp": {"type": "string"},
-                                    },
-                                }
-                            }
-                        },
-                    }
-                },
-            }
-        },
-    }
+class WhaleInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    min_usd: float = Field(25000, ge=0, le=1e15)
+    blocks: int = Field(25, ge=1, le=50)
+    limit: int = Field(15, ge=1, le=100)
 
 
-def build_402_response(resource_url: str, description: str = "BaseWhale Oracle API Access") -> JSONResponse:
-    challenge = make_x402_challenge(resource_url, description)
-    challenge_b64 = base64.b64encode(json.dumps(challenge).encode("utf-8")).decode("utf-8")
-    return JSONResponse(
-        status_code=402,
-        content=challenge,
-        headers={
-            "Payment-Required": challenge_b64,
-            "Access-Control-Expose-Headers": "Payment-Required",
-        },
-    )
+class StatsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    min_usd: float = Field(25000, ge=0, le=1e15)
+    blocks: int = Field(25, ge=1, le=50)
 
 
-async def fetch_onchain_whales(min_usd: float = 25000.0, num_blocks: int = 25, limit: int = 15) -> Dict[str, Any]:
-    """Fetch on-chain USDC transfer events directly from Base Mainnet RPC."""
+class Transfer(BaseModel):
+    tx_hash: str
+    block_number: int
+    token: str
+    amount_atomic: str
+    amount_tokens: float
+    amount_usd: float
+    from_address: str
+    to_address: str
+
+
+class WhaleResponse(BaseModel):
+    success: bool
+    network: str
+    tracked_token: str
+    valuation_source: str
+    source: str
+    fetched_at: str
+    min_usd_filter: float
+    latest_block: int
+    blocks_scanned: int
+    whale_transactions_found: int
+    total_whale_volume_usd: float
+    transactions: list[Transfer]
+    timestamp: str
+
+
+class StatsResponse(BaseModel):
+    success: bool
+    network: str
+    tracked_token: str
+    valuation_source: str
+    source: str
+    fetched_at: str
+    latest_block: int
+    blocks_scanned: int
+    total_whale_transactions: int
+    total_whale_volume_usd: float
+    largest_single_transfer_usd: float
+    average_whale_transfer_usd: float
+    volume_category: str
+    timestamp: str
+
+
+def response_schema(model):
+    """Inline local model refs so this schema also works inside Bazaar metadata."""
+    schema = model.model_json_schema()
+    definitions = schema.get("$defs", {})
+
+    def inline(value):
+        if isinstance(value, dict):
+            if "$ref" in value:
+                return inline(definitions[value["$ref"].rsplit("/", 1)[-1]])
+            return {key: inline(item) for key, item in value.items() if key != "$defs"}
+        return [inline(item) for item in value] if isinstance(value, list) else value
+
+    return inline(schema)
+
+
+app = FastAPI(title="BaseWhale Oracle x402", version="1.1.0", redirect_slashes=False,
+              description="Detects large USDC transfers in a bounded recent Base block range.")
+
+payment = PaymentGate(service="BaseWhale", payee=PAYEE_ADDRESS, amount=PRICE_ATOMIC, operations=[
+    PaidOperation(method="GET", path="/v1/whales",
+                  description="Returns large USDC transfers from up to 50 recent Base blocks; USD values assume the USDC peg.",
+                  input_schema=WhaleInput.model_json_schema(),
+                  output_schema=response_schema(WhaleResponse),
+                  example={"min_usd": 25000, "blocks": 25, "limit": 15}),
+    PaidOperation(method="GET", path="/v1/whale-stats",
+                  description="Returns count, aggregate volume, largest transfer and average for recent large USDC transfers.",
+                  input_schema=StatsInput.model_json_schema(), output_schema=StatsResponse.model_json_schema(),
+                  example={"min_usd": 25000, "blocks": 25}),
+])
+
+
+class UpstreamUnavailable(Exception):
+    """The RPC did not return a complete, valid transfer snapshot."""
+
+
+def upstream_error():
+    return JSONResponse(status_code=502, content={"success": False, "error": {
+        "code": "upstream_unavailable", "message": "Base transfer data is unavailable."}})
+
+
+async def _rpc(client, method, params):
+    response = await client.post(BASE_RPC_URL, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                                 headers={"User-Agent": "BaseWhale-Oracle/1.1"})
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or payload.get("error") or "result" not in payload:
+        raise UpstreamUnavailable()
+    return payload["result"]
+
+
+async def fetch_onchain_whales(min_usd: float = 25000, num_blocks: int = 25, limit: int = 15) -> dict:
+    """Aggregate exact token units before formatting a bounded USDC log snapshot."""
+    WhaleInput(min_usd=min_usd, blocks=num_blocks, limit=limit)
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            # 1. Get block number
-            block_resp = await client.post(
-                BASE_RPC_URL,
-                json={"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []},
-                headers={"User-Agent": "BaseWhale-Oracle/1.0"},
-            )
-            latest = int(block_resp.json()["result"], 16)
-            from_block = hex(max(latest - num_blocks, 0))
-
-            # 2. Query logs
-            logs_payload = {
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "eth_getLogs",
-                "params": [
-                    {
-                        "fromBlock": from_block,
-                        "toBlock": "latest",
-                        "address": USDC_ASSET,
-                        "topics": [TRANSFER_TOPIC],
-                    }
-                ],
-            }
-            logs_resp = await client.post(BASE_RPC_URL, json=logs_payload, headers={"User-Agent": "BaseWhale-Oracle/1.0"})
-            logs = logs_resp.json().get("result", [])
-
-            whales = []
-            total_vol = 0.0
-
-            for l in logs:
-                try:
-                    data_hex = l.get("data", "0x0")
-                    val = int(data_hex, 16) / 1e6
-                    if val >= min_usd:
-                        total_vol += val
-                        from_addr = "0x" + l["topics"][1][26:] if len(l.get("topics", [])) > 1 else "unknown"
-                        to_addr = "0x" + l["topics"][2][26:] if len(l.get("topics", [])) > 2 else "unknown"
-                        whales.append({
-                            "tx_hash": l.get("transactionHash"),
-                            "block_number": int(l.get("blockNumber", "0x0"), 16),
-                            "token": "USDC",
-                            "amount_tokens": val,
-                            "amount_usd": round(val, 2),
-                            "from_address": from_addr,
-                            "to_address": to_addr,
-                        })
-                except Exception:
-                    continue
-
-            # Sort by amount USD descending
-            whales.sort(key=lambda x: x["amount_usd"], reverse=True)
-
-            return {
-                "latest_block": latest,
-                "blocks_scanned": num_blocks,
-                "total_whale_volume_usd": round(total_vol, 2),
-                "whale_count": len(whales),
-                "transactions": whales[:limit],
-            }
-    except Exception as e:
-        return {
-            "latest_block": 0,
-            "blocks_scanned": num_blocks,
-            "total_whale_volume_usd": 0.0,
-            "whale_count": 0,
-            "transactions": [],
-            "error": str(e),
-        }
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=3.0)) as client:
+            block_result = await _rpc(client, "eth_blockNumber", [])
+            if not isinstance(block_result, str) or not re.fullmatch(r"0x[0-9a-fA-F]+", block_result):
+                raise UpstreamUnavailable()
+            latest = int(block_result, 16)
+            first = max(latest - num_blocks + 1, 0)
+            logs = await _rpc(client, "eth_getLogs", [{"fromBlock": hex(first), "toBlock": hex(latest),
+                                                      "address": USDC_ASSET, "topics": [TRANSFER_TOPIC]}])
+        if not isinstance(logs, list):
+            raise UpstreamUnavailable()
+        whales = []
+        total_atomic = largest_atomic = 0
+        for event in logs:
+            if not isinstance(event, dict):
+                raise UpstreamUnavailable()
+            if event.get("removed") is True:
+                continue
+            topics = event.get("topics")
+            if (not isinstance(topics, list) or len(topics) != 3 or topics[0] != TRANSFER_TOPIC
+                or any(not isinstance(topic, str) or not re.fullmatch(r"0x[0-9a-fA-F]{64}", topic) for topic in topics)
+                or any(topic[2:26] != "0" * 24 for topic in topics[1:])
+                or not re.fullmatch(r"0x[0-9a-fA-F]{64}", str(event.get("data", "")))
+                or not re.fullmatch(r"0x[0-9a-fA-F]{64}", str(event.get("transactionHash", "")))
+                or not re.fullmatch(r"0x[0-9a-fA-F]+", str(event.get("blockNumber", "")))
+                or event.get("address", "").lower() != USDC_ASSET.lower()):
+                raise UpstreamUnavailable()
+            block = int(event["blockNumber"], 16)
+            if not first <= block <= latest:
+                raise UpstreamUnavailable()
+            atomic = int(event["data"], 16)
+            value = Decimal(atomic) / Decimal(1_000_000)
+            if value < Decimal(str(min_usd)):
+                continue
+            total_atomic += atomic
+            largest_atomic = max(largest_atomic, atomic)
+            whales.append({"tx_hash": event["transactionHash"], "block_number": block, "token": "USDC",
+                           "amount_atomic": str(atomic), "amount_tokens": float(value), "amount_usd": round(float(value), 2),
+                           "from_address": "0x" + topics[1][-40:], "to_address": "0x" + topics[2][-40:]})
+        whales.sort(key=lambda event: int(event["amount_atomic"]), reverse=True)
+        count = len(whales)
+        return {"latest_block": latest, "blocks_scanned": latest - first + 1,
+                "total_whale_volume_usd": round(float(Decimal(total_atomic) / 1_000_000), 2),
+                "largest_single_transfer_usd": round(float(Decimal(largest_atomic) / 1_000_000), 2),
+                "average_whale_transfer_usd": round(float(Decimal(total_atomic) / 1_000_000 / count), 2) if count else 0.0,
+                "whale_count": count, "transactions": whales[:limit], "source": "base_rpc_eth_getLogs",
+                "valuation_source": "stablecoin_peg_assumption", "fetched_at": datetime.now(timezone.utc).isoformat()}
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError, KeyError, UpstreamUnavailable) as exc:
+        logger.warning("upstream_request_failed", extra={"service": "BaseWhale", "upstream": "base_rpc"})
+        raise UpstreamUnavailable() from exc
 
 
-# Public Endpoints
-@app.get("/", summary="API Index & Service Info")
+@app.get("/", summary="API index")
 async def root():
-    return {
-        "service": "BaseWhale Oracle",
-        "version": "1.0.0",
-        "network": "Base Mainnet (8453)",
-        "docs": "/docs",
-        "openapi": "/openapi.json",
-        "manifest": "/.well-known/x402",
-        "endpoints": {
-            "whales": "/v1/whales",
-            "stats": "/v1/whale-stats",
-        },
-        "price_usd": f"${PRICE_USDC:.2f}",
-        "payee": PAYEE_ADDRESS,
-        "status": "online",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    return {"service": "BaseWhale Oracle", "version": "1.1.0", "network": "Base Mainnet (8453)",
+            "docs": "/docs", "openapi": "/openapi.json", "manifest": "/.well-known/x402",
+            "endpoints": {"whales": "/v1/whales", "stats": "/v1/whale-stats"},
+            "price_usd": "$0.02", "payee": PAYEE_ADDRESS, "status": "online"}
 
 
-@app.get("/health", summary="Health Check")
+@app.get("/health")
 async def health():
-    return {
-        "status": "healthy",
-        "chain_id": 8453,
-        "payee": PAYEE_ADDRESS,
-        "time": datetime.now(timezone.utc).isoformat(),
-    }
+    return {"status": "healthy", "chain_id": 8453, "payee": PAYEE_ADDRESS}
 
 
-@app.get("/.well-known/x402", summary="x402 Discovery Manifest")
-async def x402_manifest(request: Request):
-    base_url = str(request.base_url).rstrip("/")
-    return {
-        "version": 1,
-        "name": "BaseWhale Oracle",
-        "description": "Real-Time On-Chain Whale & Large Transfer Oracle for Base Mainnet.",
-        "network": CHAIN_ID,
-        "price": f"${PRICE_USDC:.2f}",
-        "currency": "USDC",
-        "payee": PAYEE_ADDRESS,
-        "ownershipProofs": [PAYEE_ADDRESS],
-        "resources": [
-            {
-                "type": "http",
-                "method": "GET",
-                "url": f"{base_url}/v1/whales",
-                "description": "Detect real-time on-chain whale transactions and high-value transfers on Base.",
-                "price": f"${PRICE_USDC:.2f}",
-                "accepts": [
-                    {
-                        "scheme": "exact",
-                        "network": CHAIN_ID,
-                        "asset": USDC_ASSET,
-                        "amount": PRICE_ATOMIC,
-                        "payee": PAYEE_ADDRESS,
-                        "payTo": PAYEE_ADDRESS,
-                        "maxTimeoutSeconds": 300,
-                    }
-                ],
-            },
-            {
-                "type": "http",
-                "method": "POST",
-                "url": f"{base_url}/v1/whales",
-                "description": "Detect real-time on-chain whale transactions and high-value transfers on Base.",
-                "price": f"${PRICE_USDC:.2f}",
-                "accepts": [
-                    {
-                        "scheme": "exact",
-                        "network": CHAIN_ID,
-                        "asset": USDC_ASSET,
-                        "amount": PRICE_ATOMIC,
-                        "payee": PAYEE_ADDRESS,
-                        "payTo": PAYEE_ADDRESS,
-                        "maxTimeoutSeconds": 300,
-                    }
-                ],
-            },
-            {
-                "type": "http",
-                "method": "GET",
-                "url": f"{base_url}/v1/whale-stats",
-                "description": "Get summary metrics, average whale size, and volume of large transactions on Base.",
-                "price": f"${PRICE_USDC:.2f}",
-                "accepts": [
-                    {
-                        "scheme": "exact",
-                        "network": CHAIN_ID,
-                        "asset": USDC_ASSET,
-                        "amount": PRICE_ATOMIC,
-                        "payee": PAYEE_ADDRESS,
-                        "payTo": PAYEE_ADDRESS,
-                        "maxTimeoutSeconds": 300,
-                    }
-                ],
-            },
-            {
-                "type": "http",
-                "method": "POST",
-                "url": f"{base_url}/v1/whale-stats",
-                "description": "Get summary metrics, average whale size, and volume of large transactions on Base.",
-                "price": f"${PRICE_USDC:.2f}",
-                "accepts": [
-                    {
-                        "scheme": "exact",
-                        "network": CHAIN_ID,
-                        "asset": USDC_ASSET,
-                        "amount": PRICE_ATOMIC,
-                        "payee": PAYEE_ADDRESS,
-                        "payTo": PAYEE_ADDRESS,
-                        "maxTimeoutSeconds": 300,
-                    }
-                ],
-            },
-        ],
-    }
+@app.get("/.well-known/x402")
+async def manifest(request: Request):
+    return payment.manifest(request)
 
 
-# Paid Endpoint: /v1/whales
-@app.api_route("/v1/whales", methods=["GET", "POST", "HEAD"], summary="Get Live Whale Transfers (x402 Paid)")
-async def get_whales(
-    request: Request,
-    min_usd: Optional[float] = 25000.0,
-    limit: Optional[int] = 15,
-    blocks: Optional[int] = 25,
-    x_payment_response: Optional[str] = Header(None, alias="x-payment-response"),
-    payment_response: Optional[str] = Header(None, alias="payment-response"),
-):
-    if request.method == "HEAD":
-        return build_402_response(str(request.url), "BaseWhale Live Stream")
-
-    if request.method == "POST":
-        try:
-            body = await request.json()
-            min_usd = float(body.get("min_usd", min_usd))
-            limit = int(body.get("limit", limit))
-            blocks = int(body.get("blocks", blocks))
-        except Exception:
-            pass
-
-    has_payment = bool(x_payment_response or payment_response)
-    if not has_payment:
-        return build_402_response(str(request.url), f"BaseWhale Stream (>= ${min_usd:,.0f})")
-
-    res = await fetch_onchain_whales(min_usd=min_usd, num_blocks=min(blocks, 50), limit=limit)
-
-    return {
-        "success": True,
-        "network": "Base Mainnet (8453)",
-        "tracked_token": "USDC",
-        "min_usd_filter": min_usd,
-        "latest_block": res["latest_block"],
-        "blocks_scanned": res["blocks_scanned"],
-        "whale_transactions_found": res["whale_count"],
-        "total_whale_volume_usd": res["total_whale_volume_usd"],
-        "transactions": res["transactions"],
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+async def whale_data(inputs: WhaleInput):
+    try:
+        data = await fetch_onchain_whales(inputs.min_usd, inputs.blocks, inputs.limit)
+    except UpstreamUnavailable:
+        return upstream_error()
+    return {"success": True, "network": "Base Mainnet (8453)", "tracked_token": "USDC",
+            "min_usd_filter": inputs.min_usd, "latest_block": data["latest_block"],
+            "blocks_scanned": data["blocks_scanned"], "whale_transactions_found": data["whale_count"],
+            "total_whale_volume_usd": data["total_whale_volume_usd"], "transactions": data["transactions"],
+            "source": data["source"], "valuation_source": data["valuation_source"], "fetched_at": data["fetched_at"],
+            "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
-# Paid Endpoint: /v1/whale-stats
-@app.api_route("/v1/whale-stats", methods=["GET", "POST", "HEAD"], summary="Whale Activity Stats (x402 Paid)")
-async def get_whale_stats(
-    request: Request,
-    min_usd: Optional[float] = 25000.0,
-    blocks: Optional[int] = 25,
-    x_payment_response: Optional[str] = Header(None, alias="x-payment-response"),
-    payment_response: Optional[str] = Header(None, alias="payment-response"),
-):
-    if request.method == "HEAD":
-        return build_402_response(str(request.url), "BaseWhale Stats")
-
-    if request.method == "POST":
-        try:
-            body = await request.json()
-            min_usd = float(body.get("min_usd", min_usd))
-            blocks = int(body.get("blocks", blocks))
-        except Exception:
-            pass
-
-    has_payment = bool(x_payment_response or payment_response)
-    if not has_payment:
-        return build_402_response(str(request.url), "BaseWhale Statistics")
-
-    res = await fetch_onchain_whales(min_usd=min_usd, num_blocks=min(blocks, 50), limit=50)
-    txs = res.get("transactions", [])
-    avg_size = (res["total_whale_volume_usd"] / max(len(txs), 1)) if txs else 0.0
-    largest = max([t["amount_usd"] for t in txs], default=0.0)
-
-    return {
-        "success": True,
-        "network": "Base Mainnet (8453)",
-        "tracked_token": "USDC",
-        "latest_block": res["latest_block"],
-        "blocks_scanned": res["blocks_scanned"],
-        "total_whale_transactions": len(txs),
-        "total_whale_volume_usd": res["total_whale_volume_usd"],
-        "largest_single_transfer_usd": round(largest, 2),
-        "average_whale_transfer_usd": round(avg_size, 2),
-        "whale_market_impact": "high" if res["total_whale_volume_usd"] > 1_000_000 else "normal",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+@app.get("/v1/whales", response_model=WhaleResponse)
+async def get_whales(min_usd: float = Query(25000, ge=0, le=1e15, allow_inf_nan=False),
+                     blocks: int = Query(25, ge=1, le=50), limit: int = Query(15, ge=1, le=100)):
+    return await whale_data(WhaleInput(min_usd=min_usd, blocks=blocks, limit=limit))
 
 
-# Self-test endpoint
-@app.get("/self-test", summary="Test on-chain log retrieval")
+@app.post("/v1/whales", include_in_schema=False)
+async def post_whales(inputs: WhaleInput):
+    return await whale_data(inputs)
+
+
+async def stats_data(inputs: StatsInput):
+    try:
+        data = await fetch_onchain_whales(inputs.min_usd, inputs.blocks, 1)
+    except UpstreamUnavailable:
+        return upstream_error()
+    return {"success": True, "network": "Base Mainnet (8453)", "tracked_token": "USDC",
+            "latest_block": data["latest_block"], "blocks_scanned": data["blocks_scanned"],
+            "total_whale_transactions": data["whale_count"], "total_whale_volume_usd": data["total_whale_volume_usd"],
+            "largest_single_transfer_usd": data["largest_single_transfer_usd"],
+            "average_whale_transfer_usd": data["average_whale_transfer_usd"],
+            "volume_category": "high" if data["total_whale_volume_usd"] > 1_000_000 else "normal",
+            "source": data["source"], "valuation_source": data["valuation_source"], "fetched_at": data["fetched_at"],
+            "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/v1/whale-stats", response_model=StatsResponse)
+async def get_whale_stats(min_usd: float = Query(25000, ge=0, le=1e15, allow_inf_nan=False),
+                          blocks: int = Query(25, ge=1, le=50)):
+    return await stats_data(StatsInput(min_usd=min_usd, blocks=blocks))
+
+
+@app.post("/v1/whale-stats", include_in_schema=False)
+async def post_whale_stats(inputs: StatsInput):
+    return await stats_data(inputs)
+
+
+@app.get("/self-test", summary="Configuration diagnostics; no live data request")
 async def self_test():
-    res = await fetch_onchain_whales(min_usd=10000.0, num_blocks=10, limit=3)
-    return {
-        "status": "ok",
-        "latest_block": res.get("latest_block"),
-        "sample_whales_detected": res.get("whale_count"),
-        "payee_configured": PAYEE_ADDRESS,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    return {"status": "configuration_only", "payee_configured": PAYEE_ADDRESS,
+            "live_upstream_tested": False, "tracked_token": "USDC"}
 
 
-def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
-    openapi_schema = get_openapi(
-        title="BaseWhale Oracle x402",
-        version="1.0.0",
-        description="Real-Time On-Chain Whale & Large Transfer Oracle for Base Mainnet (Chain ID 8453), payable via x402.",
-        routes=app.routes,
-    )
-    openapi_schema["x-payment-info"] = {
-        "protocols": [
-            {
-                "x402": {
-                    "version": 2,
-                    "network": CHAIN_ID,
-                    "asset": USDC_ASSET,
-                    "payee": PAYEE_ADDRESS,
-                    "price_usd": PRICE_USDC,
-                }
-            }
-        ]
-    }
-    app.openapi_schema = openapi_schema
-    return app.openapi_schema
-
-
-app.openapi = custom_openapi
+payment.install(app)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=8005, reload=True)
+    uvicorn.run("server:app", host="0.0.0.0", port=8005)
