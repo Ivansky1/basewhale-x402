@@ -256,6 +256,7 @@ async def post_whale_stats(inputs: StatsInput):
 @app.get("/self-test", summary="Configuration diagnostics; no live data request")
 async def self_test():
     return {"status": "configuration_only", "payee_configured": PAYEE_ADDRESS,
+            "facilitator_configured": bool(payment.facilitator.url),
             "live_upstream_tested": False, "tracked_token": "USDC"}
 
 
